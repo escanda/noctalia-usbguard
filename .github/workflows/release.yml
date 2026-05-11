@@ -117,7 +117,7 @@ jobs:
           SANDBOX="$(mktemp -d)"
           mkdir -p "$SANDBOX/.config/noctalia"
           echo '{}' > "$SANDBOX/.config/noctalia/settings.json"
-          ( cd "$WORK/$PLUGIN_ID" && HOME="$SANDBOX" ./installer.sh -s right >/dev/null )
+          ( cd "$WORK/$PLUGIN_ID" && env -u XDG_CONFIG_HOME HOME="$SANDBOX" ./installer.sh -s right >/dev/null )
 
           python3 - "$SANDBOX" "$PLUGIN_ID" <<'PYEOF'
           import json, pathlib, sys

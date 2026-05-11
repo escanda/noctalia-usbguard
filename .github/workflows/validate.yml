@@ -132,7 +132,7 @@ jobs:
           }
           JSON
 
-          HOME="$SANDBOX" ./installer.sh -s right
+          env -u XDG_CONFIG_HOME HOME="$SANDBOX" ./installer.sh -s right
 
           # Assertions
           python3 - <<EOF
@@ -170,11 +170,11 @@ jobs:
           mkdir -p "$SANDBOX/.config/noctalia"
           echo '{}' > "$SANDBOX/.config/noctalia/settings.json"
 
-          HOME="$SANDBOX" ./installer.sh -s right >/dev/null
+          env -u XDG_CONFIG_HOME HOME="$SANDBOX" ./installer.sh -s right >/dev/null
           # Capture state after first run
           first="$(cat "$SANDBOX/.config/noctalia/settings.json")"
 
-          HOME="$SANDBOX" ./installer.sh -s right >/dev/null
+          env -u XDG_CONFIG_HOME HOME="$SANDBOX" ./installer.sh -s right >/dev/null
           second="$(cat "$SANDBOX/.config/noctalia/settings.json")"
 
           if [ "$first" != "$second" ]; then
@@ -194,8 +194,8 @@ jobs:
           {"bar": {"widgets": {"right": [{"id": "Tray"}]}}}
           JSON
 
-          HOME="$SANDBOX" ./installer.sh -s right >/dev/null
-          HOME="$SANDBOX" ./installer.sh -u       >/dev/null
+          env -u XDG_CONFIG_HOME HOME="$SANDBOX" ./installer.sh -s right >/dev/null
+          env -u XDG_CONFIG_HOME HOME="$SANDBOX" ./installer.sh -u       >/dev/null
 
           python3 - <<EOF
           import json, pathlib

@@ -1,0 +1,205 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Lets you cut a release from any branch without tagging first. Useful for
+  # testing the workflow itself. The resulting release is marked as prerelease
+  # and you supply the tag name in the form.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag name (e.g. v0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write   # required to create releases
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine tag and version
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              TAG="${{ inputs.tag }}"
+              PRERELEASE=true
+          else
+              TAG="${GITHUB_REF#refs/tags/}"
+              PRERELEASE=false
+          fi
+
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+              echo "::error::tag '$TAG' is not vMAJOR.MINOR.PATCH[-prerelease]"
+              exit 1
+          fi
+
+          VERSION="${TAG#v}"
+          # Strip any prerelease suffix before comparing to manifest.json
+          VERSION_CORE="${VERSION%%-*}"
+
+          echo "tag=$TAG"                 >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION"         >> "$GITHUB_OUTPUT"
+          echo "version_core=$VERSION_CORE" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE"   >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag matches manifest.json version
+        run: |
+          # The version in manifest.json is the source of truth for what users
+          # see in noctalia. A mismatch would be confusing, so we hard-fail.
+          MANIFEST_VERSION="$(python3 -c 'import json; print(json.load(open("manifest.json"))["version"])')"
+          TAG_VERSION="${{ steps.meta.outputs.version_core }}"
+          if [ "$MANIFEST_VERSION" != "$TAG_VERSION" ]; then
+              echo "::error file=manifest.json::manifest version ($MANIFEST_VERSION) does not match tag ($TAG_VERSION). Bump manifest.json before tagging."
+              exit 1
+          fi
+          echo "manifest version $MANIFEST_VERSION matches tag"
+
+      - name: Build plugin zip
+        id: build
+        run: |
+          # We package the plugin as a folder so users can unzip directly into
+          # ~/.config/noctalia/plugins/. The folder name MUST equal the plugin
+          # id from manifest.json (noctalia keys on directory name).
+          PLUGIN_ID="$(python3 -c 'import json; print(json.load(open("manifest.json"))["id"])')"
+          STAGE="$(mktemp -d)"
+          DEST="$STAGE/$PLUGIN_ID"
+          mkdir -p "$DEST"
+
+          # Whitelist the files that should ship. Anything else (CI, .git,
+          # local notes) stays out of the zip.
+          for f in manifest.json Main.qml BarWidget.qml Panel.qml Settings.qml README.md installer.sh; do
+              if [ ! -f "$f" ]; then
+                  echo "::error::expected file missing: $f"
+                  exit 1
+              fi
+              cp "$f" "$DEST/$f"
+          done
+
+          # If a LICENSE exists at the repo root, include it.
+          [ -f LICENSE ] && cp LICENSE "$DEST/LICENSE" || true
+
+          # Preserve installer.sh's executable bit inside the archive.
+          chmod +x "$DEST/installer.sh"
+
+          ZIP_NAME="${PLUGIN_ID}-${{ steps.meta.outputs.version }}.zip"
+          (cd "$STAGE" && zip -r "$GITHUB_WORKSPACE/$ZIP_NAME" "$PLUGIN_ID")
+
+          # Checksum for verifying downloads.
+          sha256sum "$ZIP_NAME" > "${ZIP_NAME}.sha256"
+
+          echo "zip=$ZIP_NAME"                 >> "$GITHUB_OUTPUT"
+          echo "sha=${ZIP_NAME}.sha256"        >> "$GITHUB_OUTPUT"
+
+          echo "=== archive contents ==="
+          unzip -l "$ZIP_NAME"
+          echo
+          echo "=== checksum ==="
+          cat "${ZIP_NAME}.sha256"
+
+      - name: Smoke-test the archive
+        run: |
+          # Quick sanity: unzip in a temp dir and run the installer against a
+          # fake HOME. If this fails, the release would ship a broken zip.
+          set -euo pipefail
+          WORK="$(mktemp -d)"
+          unzip -q "${{ steps.build.outputs.zip }}" -d "$WORK"
+
+          PLUGIN_ID="$(python3 -c 'import json; print(json.load(open("manifest.json"))["id"])')"
+          [ -d "$WORK/$PLUGIN_ID" ] || { echo "::error::zip is missing top-level $PLUGIN_ID/ directory"; exit 1; }
+          [ -x "$WORK/$PLUGIN_ID/installer.sh" ] || { echo "::error::installer.sh inside zip is not executable"; exit 1; }
+
+          SANDBOX="$(mktemp -d)"
+          mkdir -p "$SANDBOX/.config/noctalia"
+          echo '{}' > "$SANDBOX/.config/noctalia/settings.json"
+          ( cd "$WORK/$PLUGIN_ID" && HOME="$SANDBOX" ./installer.sh -s right >/dev/null )
+
+          python3 - "$SANDBOX" "$PLUGIN_ID" <<'PYEOF'
+          import json, pathlib, sys
+          base = pathlib.Path(sys.argv[1]) / ".config/noctalia"
+          pid = sys.argv[2]
+          assert json.loads((base/"plugins.json").read_text())["states"][pid]["enabled"] is True
+          ids = [w["id"] for w in json.loads((base/"settings.json").read_text())["bar"]["widgets"]["right"]]
+          assert pid in ids
+          assert (base/"plugins"/pid/"manifest.json").is_file()
+          print("smoke test OK")
+          PYEOF
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          # Best-effort: extract the section for this version from CHANGELOG.md
+          # if one exists, otherwise auto-generate from commits since the
+          # previous tag. The body is written to a file so it survives multiline
+          # content cleanly.
+          NOTES_FILE="$(mktemp)"
+          TAG="${{ steps.meta.outputs.tag }}"
+          VERSION="${{ steps.meta.outputs.version }}"
+
+          if [ -f CHANGELOG.md ]; then
+              # Pull lines between `## [VERSION]` (or `## VERSION`) and the next `## `.
+              python3 - "$VERSION" > "$NOTES_FILE" <<'PYEOF'
+          import re, sys, pathlib
+          version = sys.argv[1]
+          src = pathlib.Path("CHANGELOG.md").read_text()
+          pat = re.compile(rf"^##\s+\[?{re.escape(version)}\]?.*?$", re.MULTILINE)
+          m = pat.search(src)
+          if not m:
+              sys.exit(0)
+          start = m.end()
+          nxt = re.search(r"^##\s+", src[start:], re.MULTILINE)
+          end = start + nxt.start() if nxt else len(src)
+          print(src[start:end].strip())
+          PYEOF
+          fi
+
+          if [ ! -s "$NOTES_FILE" ]; then
+              # No CHANGELOG entry — fall back to git log since previous tag.
+              PREV_TAG="$(git tag --sort=-v:refname | grep -v "^$TAG$" | head -1 || true)"
+              {
+                  echo "### Changes"
+                  echo
+                  if [ -n "$PREV_TAG" ]; then
+                      git log --pretty='format:- %s (%h)' "${PREV_TAG}..HEAD" -- . ':!.github'
+                  else
+                      git log --pretty='format:- %s (%h)' -- . ':!.github' | head -20
+                  fi
+              } > "$NOTES_FILE"
+          fi
+
+          {
+              echo
+              echo "---"
+              echo
+              echo "### Install"
+              echo
+              echo '```sh'
+              echo "curl -LO https://github.com/${{ github.repository }}/releases/download/${TAG}/${{ steps.build.outputs.zip }}"
+              echo "unzip ${{ steps.build.outputs.zip }}"
+              echo "cd $(python3 -c 'import json; print(json.load(open("manifest.json"))["id"])')"
+              echo "./installer.sh"
+              echo '```'
+              echo
+              echo "Or copy the unpacked folder to \`~/.config/noctalia/plugins/\` manually."
+          } >> "$NOTES_FILE"
+
+          echo "notes_file=$NOTES_FILE" >> "$GITHUB_OUTPUT"
+          echo "=== generated notes ==="
+          cat "$NOTES_FILE"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          body_path: ${{ steps.notes.outputs.notes_file }}
+          prerelease: ${{ steps.meta.outputs.prerelease == 'true' }}
+          fail_on_unmatched_files: true
+          files: |
+            ${{ steps.build.outputs.zip }}
+            ${{ steps.build.outputs.sha }}

@@ -1,0 +1,215 @@
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate manifest.json
+        run: |
+          python3 - <<'EOF'
+          import json, sys, re, pathlib
+
+          errors = []
+          manifest_path = pathlib.Path("manifest.json")
+          if not manifest_path.is_file():
+              print("::error file=manifest.json::manifest.json is missing")
+              sys.exit(1)
+
+          try:
+              m = json.loads(manifest_path.read_text())
+          except json.JSONDecodeError as e:
+              print(f"::error file=manifest.json,line={e.lineno},col={e.colno}::invalid JSON: {e.msg}")
+              sys.exit(1)
+
+          # Required top-level fields (per noctalia plugin manifest spec).
+          required = ["id", "name", "version", "minNoctaliaVersion",
+                      "author", "license", "description", "entryPoints"]
+          for k in required:
+              if k not in m:
+                  errors.append(f"missing required field: {k}")
+
+          # id rules: kebab-case, lowercase, matches directory name (none here — flat repo).
+          plugin_id = m.get("id", "")
+          if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", plugin_id):
+              errors.append(f"id must be lowercase kebab-case, got {plugin_id!r}")
+
+          # Semver-ish.
+          for vfield in ("version", "minNoctaliaVersion"):
+              v = m.get(vfield, "")
+              if v and not re.fullmatch(r"\d+\.\d+\.\d+", v):
+                  errors.append(f"{vfield} must be MAJOR.MINOR.PATCH, got {v!r}")
+
+          # entryPoints: every declared file must exist on disk.
+          ep = m.get("entryPoints", {})
+          if not isinstance(ep, dict):
+              errors.append("entryPoints must be an object")
+          else:
+              allowed_slots = {"main", "barWidget", "desktopWidget",
+                               "controlCenterWidget", "launcherProvider",
+                               "panel", "settings"}
+              for slot, fname in ep.items():
+                  if slot not in allowed_slots:
+                      errors.append(f"unknown entry point slot: {slot}")
+                  elif not pathlib.Path(fname).is_file():
+                      errors.append(f"entryPoint {slot} → {fname} (file missing)")
+
+          if errors:
+              for e in errors:
+                  print(f"::error file=manifest.json::{e}")
+              sys.exit(1)
+          print(f"manifest.json valid (id={plugin_id} version={m['version']})")
+          EOF
+
+      - name: Validate QML files parse (syntax-level)
+        run: |
+          # No QML toolchain in CI by default. We check for the cheapest signal:
+          # unbalanced braces, which catches most copy-paste accidents.
+          python3 - <<'EOF'
+          import pathlib, sys
+
+          errors = []
+          for path in sorted(pathlib.Path(".").glob("*.qml")):
+              src = path.read_text()
+              opens = src.count("{")
+              closes = src.count("}")
+              if opens != closes:
+                  errors.append(f"{path}: unbalanced braces ({opens} open vs {closes} close)")
+
+          if errors:
+              for e in errors:
+                  print(f"::error::{e}")
+              sys.exit(1)
+          print("QML files structurally OK")
+          EOF
+
+      - name: Verify documented files exist
+        run: |
+          # Match the list the installer copies.
+          required_files=(manifest.json Main.qml BarWidget.qml Panel.qml Settings.qml README.md installer.sh)
+          missing=0
+          for f in "${required_files[@]}"; do
+              if [ ! -f "$f" ]; then
+                  echo "::error file=$f::required file missing"
+                  missing=1
+              fi
+          done
+          exit $missing
+
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      - name: Lint installer.sh
+        run: |
+          bash -n installer.sh
+          shellcheck installer.sh
+
+      - name: Dry-run installer (sandboxed)
+        run: |
+          set -euo pipefail
+          # Run the installer against a fake HOME to confirm it doesn't blow up
+          # and produces the JSON structure we expect.
+          SANDBOX="$(mktemp -d)"
+          trap 'rm -rf "$SANDBOX"' EXIT
+
+          # Seed a realistic settings.json so we test the merge path, not the
+          # "create from scratch" path.
+          mkdir -p "$SANDBOX/.config/noctalia"
+          cat > "$SANDBOX/.config/noctalia/settings.json" <<'JSON'
+          {
+            "bar": {
+              "widgets": {
+                "right": [{"id": "Tray"}, {"id": "Battery"}]
+              }
+            }
+          }
+          JSON
+
+          HOME="$SANDBOX" ./installer.sh -s right
+
+          # Assertions
+          python3 - <<EOF
+          import json, sys, pathlib
+          base = pathlib.Path("$SANDBOX/.config/noctalia")
+
+          # plugins.json: states.usbguard.enabled must be true
+          plugins = json.loads((base / "plugins.json").read_text())
+          enabled = plugins.get("states", {}).get("usbguard", {}).get("enabled")
+          assert enabled is True, f"plugin not enabled in states: {plugins}"
+          # And no stale top-level key from the early-development bug.
+          assert "usbguard" not in plugins, f"stray top-level key: {plugins}"
+
+          # settings.json: widget appended
+          settings = json.loads((base / "settings.json").read_text())
+          right = settings["bar"]["widgets"]["right"]
+          ids = [w["id"] for w in right if isinstance(w, dict)]
+          assert "usbguard" in ids, f"widget not appended: {ids}"
+          # Existing widgets preserved
+          assert "Tray" in ids and "Battery" in ids, f"existing widgets clobbered: {ids}"
+
+          # Plugin files in place
+          plugin_dir = base / "plugins" / "usbguard"
+          for f in ["manifest.json", "Main.qml", "BarWidget.qml", "Panel.qml", "Settings.qml"]:
+              assert (plugin_dir / f).is_file(), f"missing installed file: {f}"
+
+          print("installer dry-run produced expected state")
+          EOF
+
+      - name: Re-run installer (idempotency check)
+        run: |
+          set -euo pipefail
+          SANDBOX="$(mktemp -d)"
+          trap 'rm -rf "$SANDBOX"' EXIT
+          mkdir -p "$SANDBOX/.config/noctalia"
+          echo '{}' > "$SANDBOX/.config/noctalia/settings.json"
+
+          HOME="$SANDBOX" ./installer.sh -s right >/dev/null
+          # Capture state after first run
+          first="$(cat "$SANDBOX/.config/noctalia/settings.json")"
+
+          HOME="$SANDBOX" ./installer.sh -s right >/dev/null
+          second="$(cat "$SANDBOX/.config/noctalia/settings.json")"
+
+          if [ "$first" != "$second" ]; then
+              echo "::error::installer is not idempotent — settings.json changed on re-run"
+              diff <(printf %s "$first") <(printf %s "$second") || true
+              exit 1
+          fi
+          echo "installer is idempotent ✓"
+
+      - name: Uninstaller cleanup check
+        run: |
+          set -euo pipefail
+          SANDBOX="$(mktemp -d)"
+          trap 'rm -rf "$SANDBOX"' EXIT
+          mkdir -p "$SANDBOX/.config/noctalia"
+          cat > "$SANDBOX/.config/noctalia/settings.json" <<'JSON'
+          {"bar": {"widgets": {"right": [{"id": "Tray"}]}}}
+          JSON
+
+          HOME="$SANDBOX" ./installer.sh -s right >/dev/null
+          HOME="$SANDBOX" ./installer.sh -u       >/dev/null
+
+          python3 - <<EOF
+          import json, pathlib
+          base = pathlib.Path("$SANDBOX/.config/noctalia")
+
+          plugins = json.loads((base / "plugins.json").read_text())
+          assert "usbguard" not in plugins.get("states", {}), "uninstall didn't clear states"
+          assert "usbguard" not in plugins, "uninstall didn't clear top-level key"
+
+          settings = json.loads((base / "settings.json").read_text())
+          ids = [w["id"] for w in settings["bar"]["widgets"]["right"] if isinstance(w, dict)]
+          assert "usbguard" not in ids, f"uninstall left widget behind: {ids}"
+          assert "Tray" in ids, f"uninstall clobbered unrelated widgets: {ids}"
+
+          assert not (base / "plugins" / "usbguard").exists(), "plugin dir not removed"
+          print("uninstaller cleanup ✓")
+          EOF

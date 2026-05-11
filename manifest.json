@@ -1,0 +1,26 @@
+{
+  "id": "usbguard",
+  "name": "USBGuard",
+  "version": "0.1.0",
+  "minNoctaliaVersion": "3.6.0",
+  "author": "you",
+  "license": "MIT",
+  "repository": "local",
+  "description": "Watch and control USBGuard: see USB device events live, allow/block from the bar.",
+  "tags": ["Bar", "Panel", "Security"],
+  "entryPoints": {
+    "main": "Main.qml",
+    "barWidget": "BarWidget.qml",
+    "panel": "Panel.qml",
+    "settings": "Settings.qml"
+  },
+  "metadata": {
+    "defaultSettings": {
+      "notifyOnInsert": true,
+      "defaultAllowPermanent": false,
+      "usbguardCommand": "usbguard",
+      "showCountBadge": true,
+      "hideWhenEmpty": false
+    }
+  }
+}

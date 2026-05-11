@@ -55,15 +55,29 @@ QtObject {
     //
     // `usbguard watch -w` waits for the IPC socket if the daemon isn't up yet,
     // so we don't race against `usbguard.service` at session start.
+    //
+    // IMPORTANT: usbguard's watch output puts each *field* of an event on its
+    // own line (event=, target=, device_rule=...). We can't dispatch per-line.
+    // Instead, we accumulate lines into _eventBuf and flush whenever we see a
+    // new record header ("[device]" or "[IPC]"), or when the stream goes idle
+    // for a moment.
+    property string _eventBuf: ""
+
+    property Timer flushTimer: Timer {
+        id: flushTimer
+        interval: 150   // ms of inactivity that signal "event is complete"
+        repeat: false
+        onTriggered: root._flushBuffer()
+    }
+
     property Process watchProc: Process {
         id: watchProc
         // Use sh -c so we can splice in the configurable command name.
         command: ["sh", "-c", root.usbguardCmd + " watch -w"]
         running: true
 
-        // SplitParser emits one signal per newline — exactly what `watch` produces.
         stdout: SplitParser {
-            onRead: line => root._handleWatchLine(line)
+            onRead: line => root._ingestWatchLine(line)
         }
         stderr: SplitParser {
             onRead: line => console.warn("[usbguard plugin] watch stderr:", line)
@@ -175,14 +189,48 @@ QtObject {
         }
     }
 
-    // Parser for a single `usbguard watch` output line.
+    // Accumulates lines into a single record. `usbguard watch` may split
+    // an event's fields across multiple lines (Remove events do this on
+    // recent versions; Insert events sometimes do too). A new record starts
+    // when we see a "[device]" or "[IPC]" header, so on every header we flush
+    // whatever we'd accumulated so far. We also flush on a short timer in
+    // case the last event of a burst isn't followed by another header.
+    function _ingestWatchLine(line) {
+        if (line === undefined || line === null) return;
+        const trimmed = line.trim();
+        const isHeader = trimmed.startsWith("[device]") || trimmed.startsWith("[IPC]");
+
+        if (isHeader) {
+            // Flush whatever was pending before starting a new record.
+            _flushBuffer();
+            _eventBuf = trimmed;
+        } else if (_eventBuf.length > 0) {
+            // Continuation line — join with a space so the regex/field parsing
+            // sees a normal single-line event.
+            _eventBuf += " " + trimmed;
+        }
+        // No active buffer and no header → ignore.
+
+        // (Re)arm the idle flush so the final event in a burst gets handled.
+        flushTimer.restart();
+    }
+
+    function _flushBuffer() {
+        const ev = _eventBuf;
+        _eventBuf = "";
+        if (!ev) return;
+        _handleWatchEvent(ev);
+    }
+
+    // Parser for a single (now-coalesced) `usbguard watch` event.
     //
-    // Lines we care about look like:
+    // Coalesced events look like:
     //   [device] PresenceChanged: id=36 event=Insert target=block device_rule=block id 13fe:3600 serial "..." name "..." hash "..." parent-hash "..." via-port "2-4" with-interface 08:06:50 with-connect-type "hotplug"
     //   [device] PolicyChanged:   id=36 target_old=block target_new=allow device_rule=allow id 13fe:3600 ...
+    //   [device] PresenceChanged: id=33 event=Remove target=block device_rule=block id 0951:1666 ...
     //
-    // Other lines we just log and ignore.
-    function _handleWatchLine(line) {
+    // Other events we just log and ignore.
+    function _handleWatchEvent(line) {
         if (!line) return;
         if (line.indexOf("PresenceChanged") < 0 && line.indexOf("PolicyChanged") < 0)
             return;
